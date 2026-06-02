@@ -1,0 +1,1 @@
+# VidScan services package
