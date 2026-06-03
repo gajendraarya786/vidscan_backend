@@ -202,7 +202,7 @@ def process_video_job(job_id: str):
                 else:
                     resized_raw = raw_frame
                 
-                frame = scan_document(resized_raw)
+                frame = resized_raw
             except Exception:
                 logger.exception("scan_document failed for frame %d – using raw", idx)
                 frame = raw_frame
@@ -626,7 +626,7 @@ async def preview_frames(
                     resized_raw = raw_frame
                     new_w, new_h = w, h
 
-                frame = scan_document(resized_raw)
+                frame = resized_raw
             except Exception:
                 logger.exception("[preview-frames] scan_document failed for frame %d – using raw", idx)
                 frame = raw_frame
@@ -677,13 +677,17 @@ async def preview_frames(
 # POST /apply-crop
 # ---------------------------------------------------------------------------
 
+class Point2D(BaseModel):
+    x: float
+    y: float
+
 class ApplyCropRequest(BaseModel):
-    """Crop a single base64 image by percentage coordinates."""
+    """Crop a single base64 image using perspective warp with custom corners."""
     image: str      # base64-encoded JPEG/PNG
-    crop_x: float   # left edge  as % of width  (0–100)
-    crop_y: float   # top  edge  as % of height (0–100)
-    crop_width: float   # crop width  as % of image width
-    crop_height: float  # crop height as % of image height
+    tl: Point2D
+    tr: Point2D
+    br: Point2D
+    bl: Point2D
 
 
 class ApplyCropResponse(BaseModel):
@@ -692,7 +696,7 @@ class ApplyCropResponse(BaseModel):
 
 @app.post(
     "/apply-crop",
-    summary="Crop a single scanned page image using percentage coordinates",
+    summary="Crop a single scanned page image using perspective warp with custom corners",
     response_model=ApplyCropResponse,
     tags=["Edit"],
     responses={
@@ -702,8 +706,8 @@ class ApplyCropResponse(BaseModel):
 )
 async def apply_crop(body: ApplyCropRequest):
     """
-    Accepts a base64-encoded JPEG/PNG plus crop coordinates expressed as
-    percentages (0–100) of the image dimensions, applies the exact crop,
+    Accepts a base64-encoded JPEG/PNG plus custom 4-point corner coordinates expressed as
+    percentages (0–100) of the image dimensions, applies perspective warping,
     runs CLAHE + adaptive enhancement, and returns the result as base64 JPEG.
     """
     # ── Decode ────────────────────────────────────────────────────────────────
@@ -717,23 +721,25 @@ async def apply_crop(body: ApplyCropRequest):
         raise HTTPException(status_code=400, detail=f"Invalid image data: {exc}")
 
     # ── Validate coords ──────────────────────────────────────────────────
-    cx, cy, cw, ch = body.crop_x, body.crop_y, body.crop_width, body.crop_height
-    if not (0 <= cx <= 100 and 0 <= cy <= 100
-            and 0 < cw <= 100 and 0 < ch <= 100
-            and cx + cw <= 100 and cy + ch <= 100):
-        raise HTTPException(
-            status_code=400,
-            detail="Crop coordinates out of range (0–100, x+w≤100, y+h≤100).",
-        )
+    for p in (body.tl, body.tr, body.br, body.bl):
+        if not (0 <= p.x <= 100 and 0 <= p.y <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="Crop coordinates out of range (0–100).",
+            )
 
-    # ── Apply crop via scan_document manual override ──────────────────────
+    # ── Apply perspective warp via scan_document ──────────────────────
     try:
+        corners = np.array([
+            [body.tl.x, body.tl.y],
+            [body.tr.x, body.tr.y],
+            [body.br.x, body.br.y],
+            [body.bl.x, body.bl.y]
+        ], dtype=np.float32)
+        
         cropped = scan_document(
             frame,
-            crop_x_pct=cx,
-            crop_y_pct=cy,
-            crop_w_pct=cw,
-            crop_h_pct=ch,
+            corners=corners,
             enhance=False,
         )
     except Exception:

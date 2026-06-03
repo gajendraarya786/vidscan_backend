@@ -285,6 +285,7 @@ def scan_document(
     crop_y_pct: Optional[float] = None,
     crop_w_pct: Optional[float] = None,
     crop_h_pct: Optional[float] = None,
+    corners: Optional[np.ndarray] = None,
     enhance: bool = True,
 ) -> np.ndarray:
     """
@@ -297,6 +298,7 @@ def scan_document(
     crop_y_pct   : Manual top-edge override  as % of image height (0–100).
     crop_w_pct   : Manual crop width  as % of image width.
     crop_h_pct   : Manual crop height as % of image height.
+    corners      : Manual 4-point custom corners override as percentage coordinates [[x,y],...].
     enhance      : Whether to apply illumination correction + adaptive
                    thresholding. Defaults to True.
 
@@ -304,6 +306,20 @@ def scan_document(
     -------
     Processed BGR image.
     """
+
+    # ── Priority 0: Custom Corners/Perspective Warp Override ──────────────────
+    if corners is not None:
+        logger.info("scan_document: custom corners override active")
+        img_h, img_w = frame.shape[:2]
+        pts = corners.copy().astype(np.float32)
+        pts[:, 0] = pts[:, 0] / 100.0 * img_w
+        pts[:, 1] = pts[:, 1] / 100.0 * img_h
+        
+        warped = _perspective_warp(frame, pts)
+        if enhance:
+            corrected = _clahe_correction(warped)
+            return _enhance(corrected)
+        return warped
 
     # ── Priority 1: Manual Crop Override ──────────────────────────────────────
     manual_coords_provided = all(

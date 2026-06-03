@@ -36,3 +36,6 @@ Thumbs.db
 *.mkv
 *.webm
 *.pdf
+
+# Scratch debug folders
+scratch/
