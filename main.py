@@ -187,8 +187,8 @@ def process_video_job(job_id: str):
             raise ValueError("No usable frames could be extracted from the video.")
 
         # Enhance each frame and build ScannedPageItems list
-        PREVIEW_MAX_DIM = 1000
-        PREVIEW_JPEG_QUALITY = 80
+        PREVIEW_MAX_DIM = 2560
+        PREVIEW_JPEG_QUALITY = 95
         result_pages = []
 
         for idx, raw_frame in enumerate(raw_frames):
@@ -609,8 +609,8 @@ async def preview_frames(
 
 
         # ── 5. Encode each frame as base64 JPEG (resized for preview) ───────
-        PREVIEW_MAX_DIM = 1000  # slightly smaller for faster transfer and processing
-        PREVIEW_JPEG_QUALITY = 80
+        PREVIEW_MAX_DIM = 2560  # higher resolution cap for sharp details (e.g. native 1080p/2K)
+        PREVIEW_JPEG_QUALITY = 95
 
         result: List[ScannedPageItem] = []
         for idx, raw_frame in enumerate(raw_frames):
@@ -746,7 +746,7 @@ async def apply_crop(body: ApplyCropRequest):
         logger.exception("/apply-crop scan_document failed")
         raise HTTPException(status_code=500, detail="Crop failed.")
 
-    ok, buf = cv2.imencode(".jpg", cropped, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    ok, buf = cv2.imencode(".jpg", cropped, [cv2.IMWRITE_JPEG_QUALITY, 95])
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to encode cropped image.")
 
