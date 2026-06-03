@@ -5,3 +5,6 @@ opencv-python-headless==4.9.0.80
 img2pdf==0.5.1
 Pillow==10.3.0
 numpy==1.26.4
+supabase==2.4.3
+python-dotenv==1.0.1
+

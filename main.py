@@ -21,7 +21,7 @@ from typing import List
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -29,6 +29,8 @@ from pydantic import BaseModel
 from services.document_scanner import scan_document
 from services.frame_extractor import extract_frames
 from services.pdf_generator import frames_to_pdf
+from services.supabase_client import get_supabase_client, download_file, upload_file, update_job
+
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -131,6 +133,129 @@ class PreviewResponse(BaseModel):
 async def health():
     """Returns ``{status: ok}`` – used by Railway and other orchestrators."""
     return {"status": "ok"}
+
+
+def process_video_job(job_id: str):
+    """
+    Background worker task to download video from Supabase, extract frames,
+    enhance them, compile to PDF, upload, and update job status.
+    """
+    import tempfile
+    import os
+    
+    logger.info(f"Background process started for job {job_id}")
+    
+    # 1. Set status to processing
+    try:
+        update_job(job_id, {"status": "processing"})
+    except Exception as e:
+        logger.error(f"Failed to update status to processing for job {job_id}: {e}")
+        return
+
+    tmp_video_path = None
+    tmp_pdf_path = None
+    
+    try:
+        # Retrieve the job row to get the video path/URL
+        supabase = get_supabase_client()
+        job_data = supabase.table("jobs").select("video_url").eq("id", job_id).execute().data
+        if not job_data:
+            raise ValueError(f"Job {job_id} not found in database.")
+        
+        video_url = job_data[0].get("video_url")
+        if not video_url:
+            raise ValueError("No video_url found for this job.")
+
+        # Extract bucket path key from URL (if it is a full HTTP URL)
+        storage_path = video_url
+        if video_url.startswith("http"):
+            # Extract path after the public bucket name 'vidscan/'
+            storage_path = video_url.split("/public/vidscan/")[-1]
+
+        # Create local temp files for processing
+        fd_v, tmp_video_path = tempfile.mkstemp(suffix=".mp4")
+        os.close(fd_v)
+
+        # Download video from Supabase Storage 'vidscan' bucket
+        download_file("vidscan", storage_path, tmp_video_path)
+
+        # Process the video to get frames
+        raw_frames = extract_frames(tmp_video_path)
+        if not raw_frames:
+            raise ValueError("No usable frames could be extracted from the video.")
+
+        # Enhance each frame
+        scanned_frames = []
+        for idx, raw_frame in enumerate(raw_frames):
+            try:
+                # Downscale raw frame to PREVIEW_MAX_DIM (1000px) before scanning to optimize memory & CPU
+                h, w = raw_frame.shape[:2]
+                longest = max(h, w)
+                PREVIEW_MAX_DIM = 1000
+                if longest > PREVIEW_MAX_DIM:
+                    scale = PREVIEW_MAX_DIM / longest
+                    resized_raw = cv2.resize(raw_frame, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+                else:
+                    resized_raw = raw_frame
+                
+                scanned_frames.append(scan_document(resized_raw))
+            except Exception:
+                logger.exception("scan_document failed for frame %d – skipping", idx)
+
+        if not scanned_frames:
+            raise ValueError("Every frame failed to process during document scanning.")
+
+        # Generate the PDF bytes
+        pdf_bytes = frames_to_pdf(scanned_frames)
+
+        # Write PDF to a temp file
+        fd_p, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd_p)
+        with open(tmp_pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+
+        # Upload final PDF to Supabase Storage 'vidscan' bucket
+        pdf_storage_path = f"results/{job_id}.pdf"
+        pdf_url = upload_file("vidscan", pdf_storage_path, tmp_pdf_path, "application/pdf")
+
+        # Mark job as completed
+        update_job(job_id, {
+            "status": "completed",
+            "pdf_url": pdf_url
+        })
+        logger.info(f"Background process succeeded for job {job_id}")
+
+    except Exception as e:
+        logger.exception(f"Error processing job {job_id}")
+        try:
+            update_job(job_id, {
+                "status": "failed",
+                "error_message": str(e)
+            })
+        except Exception:
+            logger.error("Could not write failure status to Supabase")
+    finally:
+        # Clean up temp files
+        for path in (tmp_video_path, tmp_pdf_path):
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+
+
+@app.post(
+    "/jobs/{job_id}/process",
+    summary="Enqueue video processing background job in Supabase",
+    tags=["Jobs"],
+)
+async def process_job_endpoint(job_id: str, background_tasks: BackgroundTasks):
+    """
+    Endpoint that registers a background task to process the video for the given job_id.
+    """
+    background_tasks.add_task(process_video_job, job_id)
+    return {"status": "enqueued", "job_id": job_id}
+
 
 
 # ---------------------------------------------------------------------------
