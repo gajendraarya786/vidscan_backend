@@ -102,16 +102,15 @@ def _enhance(img: np.ndarray) -> np.ndarray:
 
 # ── Document detection ────────────────────────────────────────────────────────
 
-def _find_quad(image: np.ndarray, min_area: float):
-    h, w = image.shape[:2]
+def _find_quad(image_gray: np.ndarray, min_area: float):
+    h, w = image_gray.shape[:2]
 
     # 1. Downscale for speed and structural consistency
     scale = 500.0 / max(h, w)
-    small = cv2.resize(image, (0, 0), fx=scale, fy=scale)
+    small = cv2.resize(image_gray, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
     sh, sw = small.shape[:2]
 
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (9, 9), 0)
+    blurred = cv2.GaussianBlur(small, (9, 9), 0)
     
     # 2. Otsu thresholding to segment paper from desk
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -179,18 +178,17 @@ def _find_quad(image: np.ndarray, min_area: float):
 
 def _motion_mad(a: np.ndarray, b: np.ndarray) -> float:
     """Frame-to-frame MAD on 256×256 downscale (flip detection)."""
-    return float(np.mean(np.abs(
-        cv2.resize(a, MOTION_SIZE).astype(np.float32) -
-        cv2.resize(b, MOTION_SIZE).astype(np.float32)
-    )))
+    # a and b are already MOTION_SIZE (256, 256)
+    diff = cv2.absdiff(a, b)
+    return float(cv2.mean(diff)[0])
 
 
 def _thumb_mad(a: np.ndarray, b: np.ndarray) -> float:
     """Thumbnail MAD for same-page dedup."""
-    return float(np.mean(np.abs(
-        cv2.resize(a, THUMB_SIZE).astype(np.float32) -
-        cv2.resize(b, THUMB_SIZE).astype(np.float32)
-    )))
+    ta = cv2.resize(a, THUMB_SIZE, interpolation=cv2.INTER_NEAREST)
+    tb = cv2.resize(b, THUMB_SIZE, interpolation=cv2.INTER_NEAREST)
+    diff = cv2.absdiff(ta, tb)
+    return float(cv2.mean(diff)[0])
 
 
 def _hist_correl(a: np.ndarray, b: np.ndarray) -> float:
@@ -213,8 +211,8 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
         cap.release()
         raise RuntimeError("Cannot determine FPS.")
 
-    skip = max(1, int(round(fps / 2.0)))    # sample at 2 fps
-    logger.info("fps=%.2f  sample_every=%d  (2fps)", fps, skip)
+    skip = max(1, int(round(fps)))    # sample at 1 fps for speed
+    logger.info("fps=%.2f  sample_every=%d  (1fps)", fps, skip)
 
     pages:          list[np.ndarray] = []
     prev_small:     np.ndarray | None = None   # 256×256 gray of previous sample
@@ -226,13 +224,19 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
     frame_idx = 0
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
         if frame_idx % skip != 0:
+            ret = cap.grab()
+            if not ret:
+                break
             frame_idx += 1
             continue
+
+        ret = cap.grab()
+        if not ret:
+            break
+        ret, frame = cap.retrieve()
+        if not ret or frame is None:
+            break
 
         n_sampled += 1
         h, w = frame.shape[:2]
@@ -276,7 +280,7 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
             continue
 
         # ── 4. Document boundary detection ───────────────────────────────────
-        quad     = _find_quad(frame, min_area=h * w * MIN_DOC_AREA_RATIO)
+        quad     = _find_quad(gray, min_area=h * w * MIN_DOC_AREA_RATIO)
         use_full = True
         if quad is not None:
             qa = cv2.contourArea(cv2.convexHull(quad.astype(np.int32)))
