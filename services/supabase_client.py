@@ -7,8 +7,9 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL: str = os.getenv("SUPABASE_URL")
-SUPABASE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_URL: str = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_KEY: str = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
+
 
 _client: Client = None
 
