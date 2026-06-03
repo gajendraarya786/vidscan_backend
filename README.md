@@ -1,3 +1,12 @@
+---
+title: VidScan Backend
+emoji: 📄
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # VidScan Backend
 
 FastAPI service that accepts a video upload and returns a PDF containing one **unique** frame per second.
