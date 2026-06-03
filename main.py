@@ -138,10 +138,12 @@ async def health():
 def process_video_job(job_id: str):
     """
     Background worker task to download video from Supabase, extract frames,
-    enhance them, compile to PDF, upload, and update job status.
+    enhance them, serialize to a pages.json array with base64 images, and upload to Supabase Storage.
     """
     import tempfile
     import os
+    import json
+    import base64
     
     logger.info(f"Background process started for job {job_id}")
     
@@ -153,7 +155,7 @@ def process_video_job(job_id: str):
         return
 
     tmp_video_path = None
-    tmp_pdf_path = None
+    tmp_json_path = None
     
     try:
         # Retrieve the job row to get the video path/URL
@@ -184,44 +186,57 @@ def process_video_job(job_id: str):
         if not raw_frames:
             raise ValueError("No usable frames could be extracted from the video.")
 
-        # Enhance each frame
-        scanned_frames = []
+        # Enhance each frame and build ScannedPageItems list
+        PREVIEW_MAX_DIM = 1000
+        PREVIEW_JPEG_QUALITY = 80
+        result_pages = []
+
         for idx, raw_frame in enumerate(raw_frames):
             try:
-                # Downscale raw frame to PREVIEW_MAX_DIM (1000px) before scanning to optimize memory & CPU
+                # Downscale raw frame before scanning to optimize memory & CPU
                 h, w = raw_frame.shape[:2]
                 longest = max(h, w)
-                PREVIEW_MAX_DIM = 1000
                 if longest > PREVIEW_MAX_DIM:
                     scale = PREVIEW_MAX_DIM / longest
                     resized_raw = cv2.resize(raw_frame, (max(1, int(round(w * scale))), max(1, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
                 else:
                     resized_raw = raw_frame
                 
-                scanned_frames.append(scan_document(resized_raw))
+                frame = scan_document(resized_raw)
             except Exception:
-                logger.exception("scan_document failed for frame %d – skipping", idx)
+                logger.exception("scan_document failed for frame %d – using raw", idx)
+                frame = raw_frame
 
-        if not scanned_frames:
-            raise ValueError("Every frame failed to process during document scanning.")
+            h_f, w_f = frame.shape[:2]
+            ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
+            if not ok:
+                logger.warning("Frame %d failed to encode in background – skipping", idx)
+                continue
 
-        # Generate the PDF bytes
-        pdf_bytes = frames_to_pdf(scanned_frames)
+            result_pages.append({
+                "page_number": idx + 1,
+                "image": base64.b64encode(buf.tobytes()).decode("utf-8"),
+                "width": w_f,
+                "height": h_f
+            })
 
-        # Write PDF to a temp file
-        fd_p, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd_p)
-        with open(tmp_pdf_path, "wb") as f:
-            f.write(pdf_bytes)
+        if not result_pages:
+            raise ValueError("Every frame failed to process/encode during document scanning.")
 
-        # Upload final PDF to Supabase Storage 'vidscan' bucket
-        pdf_storage_path = f"results/{job_id}.pdf"
-        pdf_url = upload_file("vidscan", pdf_storage_path, tmp_pdf_path, "application/pdf")
+        # Write pages array to a temp JSON file
+        fd_j, tmp_json_path = tempfile.mkstemp(suffix=".json")
+        os.close(fd_j)
+        with open(tmp_json_path, "w", encoding="utf-8") as f:
+            json.dump(result_pages, f)
+
+        # Upload pages.json file to Supabase Storage 'vidscan' bucket
+        json_storage_path = f"results/{job_id}/pages.json"
+        pages_json_url = upload_file("vidscan", json_storage_path, tmp_json_path, "application/json")
 
         # Mark job as completed
         update_job(job_id, {
             "status": "completed",
-            "pdf_url": pdf_url
+            "pages_json_url": pages_json_url
         })
         logger.info(f"Background process succeeded for job {job_id}")
 
@@ -236,7 +251,7 @@ def process_video_job(job_id: str):
             logger.error("Could not write failure status to Supabase")
     finally:
         # Clean up temp files
-        for path in (tmp_video_path, tmp_pdf_path):
+        for path in (tmp_video_path, tmp_json_path):
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
