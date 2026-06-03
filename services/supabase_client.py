@@ -20,6 +20,14 @@ def get_supabase_client() -> Client:
     if _client is None:
         if not SUPABASE_URL or not SUPABASE_KEY:
             logger.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing from environment variables.")
+        
+        # Log details to debug DNS resolution / Errno -2 issues
+        logger.info(f"Initializing Supabase client with SUPABASE_URL: {SUPABASE_URL!r} (len={len(SUPABASE_URL)})")
+        if SUPABASE_KEY:
+            logger.info(f"SUPABASE_KEY: len={len(SUPABASE_KEY)}, starts with {SUPABASE_KEY[:10]!r}, ends with {SUPABASE_KEY[-10:]!r}")
+        else:
+            logger.info("SUPABASE_KEY is empty")
+
         _client = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _client
 
