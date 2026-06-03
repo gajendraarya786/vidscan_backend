@@ -469,27 +469,30 @@ async def preview_frames(
 
 
         # ── 5. Encode each frame as base64 JPEG (resized for preview) ───────
-        PREVIEW_MAX_DIM = 1200
-        PREVIEW_JPEG_QUALITY = 82
+        PREVIEW_MAX_DIM = 1000  # slightly smaller for faster transfer and processing
+        PREVIEW_JPEG_QUALITY = 80
 
         result: List[ScannedPageItem] = []
         for idx, raw_frame in enumerate(raw_frames):
             try:
-                frame = scan_document(raw_frame)
+                h, w = raw_frame.shape[:2]
+                longest = max(h, w)
+                if longest > PREVIEW_MAX_DIM:
+                    scale = PREVIEW_MAX_DIM / longest
+                    new_w = max(1, int(round(w * scale)))
+                    new_h = max(1, int(round(h * scale)))
+                    resized_raw = cv2.resize(raw_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                else:
+                    resized_raw = raw_frame
+                    new_w, new_h = w, h
+
+                frame = scan_document(resized_raw)
             except Exception:
                 logger.exception("[preview-frames] scan_document failed for frame %d – using raw", idx)
                 frame = raw_frame
 
-            h, w = frame.shape[:2]
-            longest = max(h, w)
-            if longest > PREVIEW_MAX_DIM:
-                scale = PREVIEW_MAX_DIM / longest
-                new_w = max(1, int(round(w * scale)))
-                new_h = max(1, int(round(h * scale)))
-                preview = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            else:
-                preview = frame
-                new_w, new_h = w, h
+            h_f, w_f = frame.shape[:2]
+            preview = frame
 
             ok, buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
             if not ok:
@@ -499,8 +502,8 @@ async def preview_frames(
                 ScannedPageItem(
                     page_number=idx + 1,
                     image=base64.b64encode(buf.tobytes()).decode("utf-8"),
-                    width=new_w,
-                    height=new_h,
+                    width=w_f,
+                    height=h_f,
                 )
             )
 
