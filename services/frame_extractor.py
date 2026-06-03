@@ -92,7 +92,7 @@ def _clahe(img: np.ndarray) -> np.ndarray:
 def _enhance(img: np.ndarray) -> np.ndarray:
     g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     if np.mean(g) < BRIGHTNESS_BW_THRESHOLD:
-        d  = cv2.fastNlMeansDenoising(g, h=10)
+        d  = cv2.GaussianBlur(g, (3, 3), 0)
         bw = cv2.adaptiveThreshold(d, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                    cv2.THRESH_BINARY, 21, 10)
         return cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
@@ -253,7 +253,7 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
             continue
 
         # ── 2. Blur check ─────────────────────────────────────────────────────
-        if cv2.Laplacian(gray, cv2.CV_64F).var() < BLUR_THRESHOLD:
+        if cv2.Laplacian(gray, cv2.CV_16S).var() < BLUR_THRESHOLD:
             n_blur += 1
             stable_count = 0  # Blurry frame is not stable document representation
             frame_idx += 1

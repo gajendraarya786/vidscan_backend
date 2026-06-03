@@ -210,7 +210,7 @@ def _enhance(image: np.ndarray) -> np.ndarray:
     mean_brightness = float(np.mean(gray))
 
     if mean_brightness < BRIGHTNESS_BW_THRESHOLD:
-        denoised = cv2.fastNlMeansDenoising(gray, h=10)
+        denoised = cv2.GaussianBlur(gray, (3, 3), 0)
         bw = cv2.adaptiveThreshold(
             denoised, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
