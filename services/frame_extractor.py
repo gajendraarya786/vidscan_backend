@@ -6,7 +6,7 @@ One clean page per physical flip.
 ALGORITHM (per sampled frame at 2 fps)
 ───────────────────────────────────────
   1. Compute motion MAD between current and previous RAW sample (256×256).
-     → If MAD > FLIP_THRESHOLD (50): page is being flipped → discard.
+     → If MAD > FLIP_THRESHOLD: page is being flipped → discard.
        This threshold is deliberately HIGH so normal hand-shake never triggers it.
   2. Blur check on the document ROI.
   3. Cooldown: after keeping any page skip the next COOLDOWN_SAMPLES frames
@@ -14,7 +14,18 @@ ALGORITHM (per sampled frame at 2 fps)
   4. Dedup vs last KEPT page (ROI thumbnail MAD + histogram correlation):
      → If ROI looks the same as last kept → still on same page → skip and
        reset the cooldown counter so we don't keep re-checking the same page.
-  5. If all checks pass → keep the frame → warp → correct → enhance.
+  5. Document detection — YOLO first (if available), OpenCV fallback:
+     → YOLOv8 detects the document bounding box. High confidence (>0.6) → use
+       YOLO corners directly. Low confidence or model absent → OpenCV contour
+       detection (legacy behaviour).
+  6. If all checks pass → keep the frame → warp → correct → enhance.
+
+Detection Strategy
+──────────────────
+  YOLO_AVAILABLE=True  → YOLOv8 runs first.
+    conf >= YOLO_ACCEPT_CONF  → use YOLO corners
+    conf < YOLO_ACCEPT_CONF   → run OpenCV as second opinion
+  YOLO_AVAILABLE=False → OpenCV only (original behaviour, zero regression)
 """
 
 import logging
@@ -22,26 +33,32 @@ import logging
 import cv2
 import numpy as np
 
+from services.yolo_detector import detect_document, is_yolo_available
+
 logger = logging.getLogger(__name__)
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
 
 # Flip detection (vs previous RAW sample on 256×256 downscale)
-FLIP_MAD_THRESHOLD: float   = 40.0
+FLIP_MAD_THRESHOLD: float   = 35.0  # was 40 — slightly tighter to drop motion faster
 MIN_STABLE_FRAMES: int      = 1      # Need 1 stable frame before capture
 
 # Dedup vs last KEPT page
 THUMB_SAME_PAGE_MAD: float  = 12.0   # ROI thumb MAD below this → same page
 
-# After each kept page, skip this many samples (~N × 0.5 s)
-COOLDOWN_SAMPLES: int       = 3      # ≈ 1.5 s cooldown
+# After each kept page, skip this many samples
+COOLDOWN_SAMPLES: int       = 3      # ≈ 1.5 s cooldown at 2fps
 
-# Document detection
-BLUR_THRESHOLD: float       = 90.0   # Laplacian variance; rejects blurry/motion frames
+# Document detection (OpenCV path)
+BLUR_THRESHOLD: float       = 80.0   # Laplacian variance; was 90 — slightly relaxed
 MIN_DOC_AREA_RATIO: float   = 0.10
 FULL_FRAME_THRESHOLD: float = 0.20
 PADDING_RATIO: float        = 0.15
 BRIGHTNESS_BW_THRESHOLD: float = 160.0
+
+# YOLO confidence gating
+YOLO_ACCEPT_CONF: float     = 0.60   # confidence ≥ this → trust YOLO corners
+YOLO_SKIP_CONF: float       = 0.30   # confidence < this → frame has no document
 
 THUMB_SIZE:  tuple = (128, 128)
 MOTION_SIZE: tuple = (256, 256)
@@ -100,9 +117,13 @@ def _enhance(img: np.ndarray) -> np.ndarray:
     return cv2.filter2D(img, -1, k)
 
 
-# ── Document detection ────────────────────────────────────────────────────────
+# ── Document detection (OpenCV) ────────────────────────────────────────────────
 
-def _find_quad(image_gray: np.ndarray, min_area: float):
+def _find_quad_opencv(image_gray: np.ndarray, min_area: float):
+    """
+    Legacy OpenCV-based document boundary detection.
+    Used as fallback when YOLO is unavailable or low-confidence.
+    """
     h, w = image_gray.shape[:2]
 
     # 1. Downscale for speed and structural consistency
@@ -111,10 +132,10 @@ def _find_quad(image_gray: np.ndarray, min_area: float):
     sh, sw = small.shape[:2]
 
     blurred = cv2.GaussianBlur(small, (9, 9), 0)
-    
+
     # 2. Otsu thresholding to segment paper from desk
     _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
+
     # 3. Morphological close to bridge internal lines/text
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
@@ -122,24 +143,24 @@ def _find_quad(image_gray: np.ndarray, min_area: float):
     best_quad = None
     max_quad_area = 0.0
 
-    # 4. Search contours on both foreground and background to support dark-on-light & light-on-dark
+    # 4. Search contours on both foreground and background
     for t_img in [thresh, cv2.bitwise_not(thresh)]:
         contours, _ = cv2.findContours(t_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
             continue
-            
+
         for c in sorted(contours, key=cv2.contourArea, reverse=True)[:3]:
             area = cv2.contourArea(c)
             if area < min_area * (scale ** 2):
                 continue
-            
+
             # Skip if the region is the entire canvas (likely pure background)
             if area > 0.95 * sh * sw:
                 continue
 
             hull = cv2.convexHull(c)
             peri = cv2.arcLength(hull, True)
-            
+
             quad = None
             # Multi-epsilon DP approximation
             for eps in [0.02, 0.03, 0.04, 0.05, 0.06]:
@@ -147,7 +168,7 @@ def _find_quad(image_gray: np.ndarray, min_area: float):
                 if len(approx) == 4:
                     quad = approx.reshape(4, 2)
                     break
-            
+
             # Fallback to extreme convex hull corners if 4-point approx fails
             if quad is None:
                 pts = hull.reshape(-1, 2)
@@ -170,8 +191,47 @@ def _find_quad(image_gray: np.ndarray, min_area: float):
     if best_quad is not None:
         # Scale back to original coordinates
         return (best_quad / scale).astype(np.float32)
-        
+
     return None
+
+
+def _find_quad(
+    frame: np.ndarray,
+    gray: np.ndarray,
+) -> tuple[np.ndarray | None, str]:
+    """
+    Unified document detection: YOLO first, OpenCV fallback.
+
+    Returns
+    -------
+    quad : np.ndarray | None
+        4×2 corner array in pixel coords, or None to use full frame.
+    source : str
+        'yolo' | 'opencv' | 'none'
+    """
+    h, w = frame.shape[:2]
+    min_area = h * w * MIN_DOC_AREA_RATIO
+
+    # ── YOLOv8 path ───────────────────────────────────────────────────────────
+    if is_yolo_available():
+        corners, conf = detect_document(frame)
+        logger.info("YOLO detection  conf=%.3f", conf)
+
+        if corners is not None and conf >= YOLO_ACCEPT_CONF:
+            # High-confidence YOLO result — use directly
+            return corners.astype(np.float32), "yolo"
+
+        if conf < YOLO_SKIP_CONF and corners is None:
+            # YOLO is very confident there's no document here
+            # Still try OpenCV in case YOLO is wrong, but log it
+            logger.info("YOLO: low conf (%.3f) – trying OpenCV fallback", conf)
+
+    # ── OpenCV fallback ───────────────────────────────────────────────────────
+    quad = _find_quad_opencv(gray, min_area)
+    if quad is not None:
+        return quad, "opencv"
+
+    return None, "none"
 
 
 # ── Similarity metrics ────────────────────────────────────────────────────────
@@ -203,6 +263,13 @@ def _hist_correl(a: np.ndarray, b: np.ndarray) -> float:
 
 def extract_frames(video_path: str) -> list[np.ndarray]:
     """Return one scanned image per unique document page in *video_path*."""
+
+    # Log detection mode once at startup
+    if is_yolo_available():
+        logger.info("extract_frames: YOLOv8 document detector is ACTIVE ✓")
+    else:
+        logger.info("extract_frames: YOLOv8 not available – using OpenCV-only detection")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path!r}")
@@ -211,8 +278,9 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
         cap.release()
         raise RuntimeError("Cannot determine FPS.")
 
-    skip = max(1, int(round(fps)))    # sample at 1 fps for speed
-    logger.info("fps=%.2f  sample_every=%d  (1fps)", fps, skip)
+    # Sample at 2 fps for better coverage (was 1 fps)
+    skip = max(1, int(round(fps / 2)))
+    logger.info("fps=%.2f  sample_every=%d frames (2fps)", fps, skip)
 
     pages:          list[np.ndarray] = []
     prev_small:     np.ndarray | None = None   # 256×256 gray of previous sample
@@ -221,6 +289,7 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
     stable_count:   int               = 0
 
     n_sampled = n_flip = n_blur = n_cool = n_dup = 0
+    n_yolo_kept = n_opencv_kept = 0
     frame_idx = 0
 
     while True:
@@ -248,7 +317,6 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
         prev_small = small
 
         if flip_mad > FLIP_MAD_THRESHOLD:
-            # Large inter-sample change → page is in motion or hand is moving → discard
             cooldown = 0
             stable_count = 0
             n_flip  += 1
@@ -257,30 +325,33 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
             continue
 
         # ── 2. Blur check ─────────────────────────────────────────────────────
-        if cv2.Laplacian(gray, cv2.CV_16S).var() < BLUR_THRESHOLD:
+        blur_var = cv2.Laplacian(gray, cv2.CV_16S).var()
+        if blur_var < BLUR_THRESHOLD:
             n_blur += 1
-            stable_count = 0  # Blurry frame is not stable document representation
+            stable_count = 0
+            logger.debug("Blurry frame (var=%.1f < %.1f) – skipping", blur_var, BLUR_THRESHOLD)
             frame_idx += 1
             continue
 
         # ── 3. Cooldown ───────────────────────────────────────────────────────
         if cooldown > 0:
             cooldown -= 1
-            stable_count = 0  # Reset stability during cooldown period
+            stable_count = 0
             n_cool   += 1
             frame_idx += 1
             continue
 
         # If it passes motion, blur, and cooldown checks, it counts as a stable frame
         stable_count += 1
-        logger.info("Stable frame (MAD=%.1f) – stability count = %d", flip_mad, stable_count)
+        logger.info("Stable frame (MAD=%.1f  blur=%.1f) – stability count = %d", flip_mad, blur_var, stable_count)
 
         if stable_count < MIN_STABLE_FRAMES:
             frame_idx += 1
             continue
 
-        # ── 4. Document boundary detection ───────────────────────────────────
-        quad     = _find_quad(gray, min_area=h * w * MIN_DOC_AREA_RATIO)
+        # ── 4. Document boundary detection (YOLO + OpenCV) ───────────────────
+        quad, det_source = _find_quad(frame, gray)
+
         use_full = True
         if quad is not None:
             qa = cv2.contourArea(cv2.convexHull(quad.astype(np.int32)))
@@ -301,10 +372,10 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
         if last_roi_gray is not None:
             mad  = _thumb_mad(roi_gray, last_roi_gray)
             corr = _hist_correl(roi_gray, last_roi_gray)
-            logger.info("dedup  flip_mad=%.1f  mad=%.1f  corr=%.3f", flip_mad, mad, corr)
+            logger.info("dedup  flip_mad=%.1f  mad=%.1f  corr=%.3f  det=%s", flip_mad, mad, corr, det_source)
 
             if mad < THUMB_SAME_PAGE_MAD:
-                # Still on the same page – start a short cooldown and move on
+                # Still on the same page
                 cooldown  = COOLDOWN_SAMPLES
                 stable_count = 0
                 n_dup    += 1
@@ -317,9 +388,14 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
         cooldown      = COOLDOWN_SAMPLES
         stable_count  = 0
 
+        if det_source == "yolo":
+            n_yolo_kept += 1
+        else:
+            n_opencv_kept += 1
+
         logger.info(
-            "KEPT page #%d  flip=%.1f  %s",
-            len(pages), flip_mad,
+            "KEPT page #%d  flip=%.1f  det=%s  %s",
+            len(pages), flip_mad, det_source,
             "full" if use_full else "detected-document",
         )
 
@@ -327,7 +403,9 @@ def extract_frames(video_path: str) -> list[np.ndarray]:
 
     cap.release()
     logger.info(
-        "Done. sampled=%d  flip=%d  blur=%d  cooldown=%d  dup=%d  kept=%d",
+        "Done. sampled=%d  flip=%d  blur=%d  cooldown=%d  dup=%d  kept=%d  "
+        "(yolo=%d  opencv=%d)",
         n_sampled, n_flip, n_blur, n_cool, n_dup, len(pages),
+        n_yolo_kept, n_opencv_kept,
     )
     return pages

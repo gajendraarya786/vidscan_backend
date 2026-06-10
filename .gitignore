@@ -39,3 +39,16 @@ Thumbs.db
 
 # Scratch debug folders
 scratch/
+
+# YOLOv8 model files (large binary — deploy via Dockerfile or manual copy)
+models/*.pt
+models/*.onnx
+
+# YOLOv8 training artifacts
+runs/
+training_frames/
+
+# YOLO cache
+*.cache
+*.log
+training_frames/

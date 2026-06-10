@@ -213,11 +213,27 @@ def process_video_job(job_id: str):
                 logger.warning("Frame %d failed to encode in background – skipping", idx)
                 continue
 
+            from services.document_scanner import _find_document_quad, _order_points
+            quad_pct = None
+            try:
+                quad = _find_document_quad(frame)
+                if quad is not None:
+                    rect = _order_points(quad)
+                    quad_pct = {
+                        "tl": {"x": float(rect[0][0]/w_f*100), "y": float(rect[0][1]/h_f*100)},
+                        "tr": {"x": float(rect[1][0]/w_f*100), "y": float(rect[1][1]/h_f*100)},
+                        "br": {"x": float(rect[2][0]/w_f*100), "y": float(rect[2][1]/h_f*100)},
+                        "bl": {"x": float(rect[3][0]/w_f*100), "y": float(rect[3][1]/h_f*100)},
+                    }
+            except Exception:
+                pass
+
             result_pages.append({
                 "page_number": idx + 1,
                 "image": base64.b64encode(buf.tobytes()).decode("utf-8"),
                 "width": w_f,
-                "height": h_f
+                "height": h_f,
+                "quad": quad_pct
             })
 
         if not result_pages:
@@ -512,12 +528,23 @@ async def preview_frame(body: PreviewRequest):
 # POST /preview-frames   (main scan & preview flow)
 # ---------------------------------------------------------------------------
 
+class Point2D(BaseModel):
+    x: float
+    y: float
+
+class PerspectivePoints(BaseModel):
+    tl: Point2D
+    tr: Point2D
+    br: Point2D
+    bl: Point2D
+
 class ScannedPageItem(BaseModel):
     """One scanned page returned by /preview-frames."""
     page_number: int
     image: str        # base64-encoded JPEG
     width: int
     height: int
+    quad: PerspectivePoints | None = None
 
 
 @app.post(
@@ -638,12 +665,28 @@ async def preview_frames(
             if not ok:
                 logger.warning("[preview-frames] frame %d failed to encode – skipping", idx)
                 continue
+            from services.document_scanner import _find_document_quad, _order_points
+            quad_pct = None
+            try:
+                quad = _find_document_quad(frame)
+                if quad is not None:
+                    rect = _order_points(quad)
+                    quad_pct = {
+                        "tl": {"x": float(rect[0][0]/w_f*100), "y": float(rect[0][1]/h_f*100)},
+                        "tr": {"x": float(rect[1][0]/w_f*100), "y": float(rect[1][1]/h_f*100)},
+                        "br": {"x": float(rect[2][0]/w_f*100), "y": float(rect[2][1]/h_f*100)},
+                        "bl": {"x": float(rect[3][0]/w_f*100), "y": float(rect[3][1]/h_f*100)},
+                    }
+            except Exception:
+                pass
+
             result.append(
                 ScannedPageItem(
                     page_number=idx + 1,
                     image=base64.b64encode(buf.tobytes()).decode("utf-8"),
                     width=w_f,
                     height=h_f,
+                    quad=quad_pct,
                 )
             )
 
