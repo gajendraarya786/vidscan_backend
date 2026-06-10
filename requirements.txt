@@ -8,5 +8,5 @@ numpy==1.26.4
 supabase==2.4.3
 python-dotenv==1.0.1
 # YOLOv8 document detection (optional — server works without it via OpenCV fallback)
-ultralytics==8.2.18
+ultralytics>=8.3.0
 
